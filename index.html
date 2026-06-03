@@ -11,6 +11,9 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     
     <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Supabase JS Client (v2) -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 
@@ -60,14 +63,65 @@
         const { useState, useEffect, createContext, useContext, useRef } = React;
 
         // ----------------------------------------------------------------------
-        // ⚠️ SETUP: ใส่ URL ของ Google Script ที่ Deploy New Version แล้วที่นี่
-        const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycby5CoICz_TNniBb1PyC37HaDFGK8Ah31QzEzUeU_INGfkDlK-H0TlFfwT5m2qAgd8Zz/exec"; 
+        // ⚠️ SETUP: ใส่ค่าจากโปรเจกต์ Supabase ของคุณที่นี่
+        //   หาได้จาก Supabase Dashboard > Project Settings > API
+        const SUPABASE_URL = "https://fzguxtchjsnirbwsrfoy.supabase.co";
+        const SUPABASE_ANON_KEY = "sb_publishable_GvuA9YgKWN_Gy946Y_Z6Mg_QGLaR73y";
         // ----------------------------------------------------------------------
 
+        // สร้าง Supabase client (ถ้ายังไม่ได้ใส่ค่า จะเป็น null และแอปจะทำงานแบบออฟไลน์)
+        const sb = (window.supabase && SUPABASE_URL && !SUPABASE_URL.includes("YOUR-PROJECT"))
+            ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+            : null;
+
+        // แปลง base64 (data URI) เป็น Blob เพื่ออัปโหลดเป็นไฟล์
+        const dataUriToBlob = (dataUri) => {
+            const [meta, b64] = dataUri.split(',');
+            const mime = (meta.match(/data:(.*?);/) || [])[1] || 'image/jpeg';
+            const bin = atob(b64);
+            const arr = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            return new Blob([arr], { type: mime });
+        };
+
+        // อัปโหลดรูป (base64) ไปเก็บเป็นไฟล์ใน Supabase Storage แล้วคืน URL
+        // ถ้าไม่ใช่ base64 (เป็น URL อยู่แล้ว) หรืออัปโหลดไม่สำเร็จ จะคืนค่าเดิมกลับไป
+        const uploadPhoto = async (dataUri, keyId) => {
+            if (!sb || !dataUri || !dataUri.startsWith('data:')) return dataUri || null;
+            try {
+                const blob = dataUriToBlob(dataUri);
+                const path = `${keyId}_${Date.now()}.jpg`;
+                const { error } = await sb.storage.from('avatars')
+                    .upload(path, blob, { contentType: 'image/jpeg', upsert: true });
+                if (error) throw error;
+                const { data } = sb.storage.from('avatars').getPublicUrl(path);
+                return data.publicUrl || dataUri;
+            } catch (e) {
+                console.warn('อัปโหลดรูปไป Storage ไม่สำเร็จ จะเก็บเป็น base64 แทน:', e.message);
+                return dataUri; // สำรอง: ถ้า Storage ยังไม่พร้อม ยังลงทะเบียนได้โดยเก็บ base64
+            }
+        };
+
+        // แปลง user record จาก DB ให้เป็นรูปแบบที่ UI ใช้ (ชนิดข้อมูลให้ถูกต้อง)
+        const normalizeUser = (u) => ({
+            ...u,
+            quota: parseFloat(u.quota) || 0,
+            approved: !!u.approved,
+        });
+
+        // รูปโปรไฟล์: ตอนนี้เก็บเป็น base64 (data URI) ตรงๆ ใน Supabase
+        // ฟังก์ชันนี้รองรับทั้งรูปแบบใหม่ (data:) และข้อมูลเก่าจาก Google Drive
         const getDriveImgUrl = (url) => {
             if (!url) return null;
-            const idMatch = url.match(/[-\w]{25,}/);
-            return idMatch ? `https://drive.google.com/thumbnail?id=${idMatch[0]}&sz=w1000` : url;
+            if (url.startsWith('data:')) return url;                 // base64 จาก Supabase
+            if (url.startsWith('http')) {
+                if (url.includes('drive.google')) {                  // รองรับลิงก์ Drive เดิม
+                    const idMatch = url.match(/[-\w]{25,}/);
+                    if (idMatch) return `https://drive.google.com/thumbnail?id=${idMatch[0]}&sz=w1000`;
+                }
+                return url;
+            }
+            return url;
         };
 
         const IconBase = ({ d, size = 24, className = "" }) => (
@@ -113,7 +167,7 @@
             const updateMasterQueue = async (newQueueIds) => {
                 setMasterQueueIds(newQueueIds);
                 const queueObjects = newQueueIds.map(id => users.find(u => u.id === id)).filter(x=>x);
-                await syncToGoogle({ action: 'saveMasterQueue', queue: queueObjects });
+                await syncToDb({ action: 'saveMasterQueue', queue: queueObjects });
             };
             const [pendingUsers, setPendingUsers] = useState([]); 
             const [bookings, setBookings] = useState({}); 
@@ -138,48 +192,100 @@
             };
 
             useEffect(() => {
-                if (GOOGLE_SCRIPT_URL) {
-                    fetchDataFromGoogle();
+                if (sb) {
+                    fetchData();
                 }
             }, []);
 
             const [otHistory, setOtHistory] = useState([]);
                 useEffect(() => {
-                if (isOnline) {
-                    const interval = setInterval(() => {
-                        fetch(GOOGLE_SCRIPT_URL)
-                            .then(res => res.json())
-                            .then(data => {
-                                if (data.status === 'success') {
-                                    setOtAssignments(data.otAssignments || []);
-                                    setOtHistory(data.otHistory || []);
-                                    setIsOnline(true);
-                                }
-                            })
-                            .catch(err => console.error("Auto fetch error", err));
+                if (isOnline && sb) {
+                    // อัปเดตข้อมูล OT อัตโนมัติทุก 5 วินาที (sync ข้ามอุปกรณ์)
+                    const interval = setInterval(async () => {
+                        try {
+                            const [otRes, ohRes] = await Promise.all([
+                                sb.from('ot_assignments').select('*'),
+                                sb.from('ot_history').select('*'),
+                            ]);
+                            if (!otRes.error) {
+                                setOtAssignments((otRes.data || []).map(o => ({
+                                    id: o.id, date: o.date, type: o.type, queueData: o.queue_data || []
+                                })));
+                            }
+                            if (!ohRes.error) setOtHistory(ohRes.data || []);
+                            setIsOnline(true);
+                        } catch (err) {
+                            console.error("Auto fetch error", err);
+                        }
                     }, 5000);
                     return () => clearInterval(interval);
                 }
             }, [isOnline]);
 
-            const fetchDataFromGoogle = async () => {
+            const fetchData = async () => {
+                if (!sb) { setIsOnline(false); return; }
                 setIsLoading(true);
                 try {
-                    const response = await fetch(GOOGLE_SCRIPT_URL);
-                    const data = await response.json();
-                    if (data.status === 'success') {
-                        setUsers(data.users || []);
-                        setPendingUsers(data.pendingUsers || []);
-                        setBookings(data.bookings || {});
-                        setHolidays(data.holidays || {});
-                        if (data.settings) setSettings(data.settings);
-                        if (data.admin) setAdminCreds(data.admin);
-                        setOtAssignments(data.otAssignments || []);
-                        setMasterQueueIds(data.masterQueue || []);
-                        setOtHistory(data.otHistory || []);
+                    const [uRes, bRes, hRes, sRes, aRes, mRes, otRes, ohRes] = await Promise.all([
+                        sb.from('app_users').select('*'),
+                        sb.from('bookings').select('*'),
+                        sb.from('holidays').select('*'),
+                        sb.from('settings').select('*').limit(1),
+                        sb.from('admin_account').select('*').limit(1),
+                        sb.from('master_queue').select('*').order('position', { ascending: true }),
+                        sb.from('ot_assignments').select('*'),
+                        sb.from('ot_history').select('*'),
+                    ]);
 
-                        setIsOnline(true);
+                    if (uRes.error) throw uRes.error;
+
+                    // แยก users (อนุมัติแล้ว) กับ pendingUsers (รออนุมัติ)
+                    const allUsers = (uRes.data || []).map(normalizeUser);
+                    setUsers(allUsers.filter(u => u.approved));
+                    setPendingUsers(allUsers.filter(u => !u.approved));
+
+                    // bookings: แปลงเป็น object map key = `${dateKey}_${userId}`
+                    const bk = {};
+                    (bRes.data || []).forEach(b => {
+                        bk[`${b.date_key}_${b.user_id}`] = {
+                            date: b.date_key,
+                            userId: b.user_id,
+                            userName: b.user_name,
+                            type: b.type,
+                            status: b.status,
+                            amount: parseFloat(b.amount) || 1,
+                        };
+                    });
+                    setBookings(bk);
+
+                    // holidays: object map key = dateKey
+                    const hd = {};
+                    (hRes.data || []).forEach(h => { hd[h.date_key] = h.status; });
+                    setHolidays(hd);
+
+                    if (sRes.data && sRes.data[0]) {
+                        const s = sRes.data[0];
+                        setSettings({
+                            max_leaves_per_day: s.max_leaves_per_day,
+                            default_quota: s.default_quota,
+                            min_attendance_percent: s.min_attendance_percent,
+                            min_advance_days: s.min_advance_days,
+                            max_advance_months: s.max_advance_months,
+                        });
                     }
+                    if (aRes.data && aRes.data[0]) {
+                        setAdminCreds({ username: aRes.data[0].username, password: aRes.data[0].password });
+                    }
+
+                    setMasterQueueIds((mRes.data || []).map(m => m.user_id));
+
+                    setOtAssignments((otRes.data || []).map(o => ({
+                        id: o.id, date: o.date, type: o.type, queueData: o.queue_data || []
+                    })));
+
+                    setOtHistory(ohRes.data || []);
+
+                    setIsOnline(true);
                 } catch (error) {
                     console.error("Connection Failed:", error);
                     setIsOnline(false);
@@ -188,25 +294,172 @@
                 }
             };
 
-            const syncToGoogle = async (payload) => {
-                if (!GOOGLE_SCRIPT_URL) return { status: 'success' };
+            // ชั้นกลางสำหรับเขียนข้อมูลลง Supabase — รับ payload รูปแบบเดิม (มี action)
+            // แล้ว map ไปยังคำสั่งของ Supabase เพื่อให้โค้ดส่วน UI เดิมไม่ต้องแก้
+            const syncToDb = async (payload) => {
+                if (!sb) return { status: 'success' };
                 setIsLoading(true);
                 try {
-                    const response = await fetch(GOOGLE_SCRIPT_URL, {
-                        method: 'POST',
-                        body: JSON.stringify(payload)
-                    });
-                    return await response.json();
+                    const a = payload.action;
+
+                    if (a === 'register') {
+                        const { action, ...u } = payload;
+                        const row = {
+                            id: u.id,
+                            firstName: u.firstName || '',
+                            lastName: u.lastName || '',
+                            nickName: u.nickName || '',
+                            phone: u.phone || '',
+                            department: u.department || '',
+                            password: u.password || '',
+                            role: u.role || 'member',
+                            quota: Number(u.quota) || 10,
+                            photo: u.photo || null,
+                            approved: false,
+                        };
+                        // อัปโหลดรูปไป Storage (ถ้าเป็น base64) แล้วเก็บเป็น URL
+                        row.photo = await uploadPhoto(row.photo, row.id);
+                        const { error } = await sb.from('app_users').insert(row);
+                        if (error) throw error;
+                        return { status: 'success', photoUrl: row.photo };
+                    }
+
+                    if (a === 'approveUser') {
+                        const { error } = await sb.from('app_users')
+                            .update({ approved: true }).eq('id', payload.userId);
+                        if (error) throw error;
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'editUser') {
+                        const { action, id, ...rest } = payload;
+                        const allowed = ['firstName','lastName','nickName','phone','department','role','photo'];
+                        const upd = {};
+                        allowed.forEach(k => { if (rest[k] !== undefined) upd[k] = rest[k]; });
+                        if (rest.quota !== undefined) upd.quota = Number(rest.quota) || 0;
+                        if (rest.password) upd.password = rest.password; // เปลี่ยนรหัสเฉพาะตอนกรอกใหม่
+                        // ถ้ามีรูปใหม่ (base64) อัปโหลดไป Storage แล้วเก็บเป็น URL
+                        if (upd.photo) upd.photo = await uploadPhoto(upd.photo, id);
+                        const { error } = await sb.from('app_users').update(upd).eq('id', id);
+                        if (error) throw error;
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'deleteUser') {
+                        await sb.from('bookings').delete().eq('user_id', payload.userId);
+                        const { error } = await sb.from('app_users').delete().eq('id', payload.userId);
+                        if (error) throw error;
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'saveSettings') {
+                        const s = payload.settings || {};
+                        const { error } = await sb.from('settings').upsert({
+                            id: 1,
+                            max_leaves_per_day: Number(s.max_leaves_per_day) || 5,
+                            default_quota: Number(s.default_quota) || 10,
+                            min_attendance_percent: Number(s.min_attendance_percent) || 96,
+                            min_advance_days: (s.min_advance_days !== undefined && s.min_advance_days !== '') ? Number(s.min_advance_days) : 3,
+                            max_advance_months: (s.max_advance_months !== undefined && s.max_advance_months !== '') ? Number(s.max_advance_months) : 3,
+                        });
+                        if (error) throw error;
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'toggleBooking') {
+                        if (payload.method === 'remove') {
+                            const { error } = await sb.from('bookings').delete()
+                                .eq('date_key', payload.dateKey)
+                                .eq('user_id', payload.userId);
+                            if (error) throw error;
+                        } else {
+                            const { error } = await sb.from('bookings').upsert({
+                                date_key: payload.dateKey,
+                                user_id: payload.userId,
+                                user_name: payload.userName || '',
+                                type: payload.type || 'vacation',
+                                status: 'active',
+                                amount: Number(payload.amount) || 1,
+                            }, { onConflict: 'date_key,user_id' });
+                            if (error) throw error;
+                        }
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'updateHoliday') {
+                        if (payload.status === undefined || payload.status === null) {
+                            const { error } = await sb.from('holidays').delete()
+                                .eq('date_key', payload.dateKey);
+                            if (error) throw error;
+                        } else {
+                            const { error } = await sb.from('holidays').upsert({
+                                date_key: payload.dateKey,
+                                status: payload.status,
+                            }, { onConflict: 'date_key' });
+                            if (error) throw error;
+                        }
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'saveMasterQueue') {
+                        const queue = payload.queue || [];
+                        // ล้างคิวเดิมทั้งหมดแล้วเขียนใหม่ตามลำดับ
+                        await sb.from('master_queue').delete().gte('position', 0);
+                        if (queue.length) {
+                            const rows = queue.map((u, i) => ({ position: i, user_id: u.id }));
+                            const { error } = await sb.from('master_queue').insert(rows);
+                            if (error) throw error;
+                        }
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'createOT') {
+                        const { action, ...rest } = payload;
+                        const row = {
+                            id: rest.id || ('ot_' + Date.now()),
+                            date: rest.date || null,
+                            type: rest.type || null,
+                            queue_data: rest.queueData || [],
+                        };
+                        const { error } = await sb.from('ot_assignments').upsert(row);
+                        if (error) throw error;
+                        return { status: 'success' };
+                    }
+
+                    if (a === 'respondOT' || a === 'cancelOT') {
+                        const { data: rows, error: e1 } = await sb.from('ot_assignments')
+                            .select('*').eq('id', payload.otId).limit(1);
+                        if (e1) throw e1;
+                        const ot = rows && rows[0];
+                        if (ot) {
+                            let q = ot.queue_data || [];
+                            const newStatus = (a === 'cancelOT') ? 'cancelled' : payload.response;
+                            q = q.map(x => String(x.userId) === String(payload.userId)
+                                ? { ...x, status: newStatus } : x);
+                            // ถ้าปฏิเสธ ให้เลื่อนคนถัดไปที่ยัง waiting ขึ้นมาเป็น pending
+                            if (a === 'respondOT' && payload.response === 'rejected') {
+                                const idx = q.findIndex(x => x.status === 'waiting');
+                                if (idx !== -1) q[idx].status = 'pending';
+                            }
+                            const { error: e2 } = await sb.from('ot_assignments')
+                                .update({ queue_data: q }).eq('id', payload.otId);
+                            if (e2) throw e2;
+                        }
+                        return { status: 'success' };
+                    }
+
+                    return { status: 'success' };
                 } catch (error) {
-                    return { status: 'error', message: "เชื่อมต่อ Server ไม่สำเร็จ" };
+                    console.error("Supabase action error:", error);
+                    return { status: 'error', message: error.message || "เชื่อมต่อฐานข้อมูลไม่สำเร็จ" };
                 } finally {
                     setIsLoading(false);
                 }
             };
 
             const createOT = async (payload) => {
-                const result = await syncToGoogle({ action: 'createOT', ...payload });
-                if (result.status === 'success') fetchDataFromGoogle();
+                const result = await syncToDb({ action: 'createOT', ...payload });
+                if (result.status === 'success') fetchData();
                 return result;
             };
 
@@ -227,8 +480,8 @@
                 });
                 setOtAssignments(updatedOT);
 
-                const result = await syncToGoogle({ action: 'respondOT', otId, userId, response });
-                if (result.status !== 'success') fetchDataFromGoogle(); 
+                const result = await syncToDb({ action: 'respondOT', otId, userId, response });
+                if (result.status !== 'success') fetchData(); 
                 return result;
             };
 
@@ -237,8 +490,8 @@
                 const safeQuota = userData.quota ? Number(userData.quota) : 10;
                 let newUser = { ...userData, id: newId, role: 'member', quota: safeQuota };
 
-                if (GOOGLE_SCRIPT_URL) {
-                    const result = await syncToGoogle({ action: 'register', ...newUser });
+                if (sb) {
+                    const result = await syncToDb({ action: 'register', ...newUser });
                     if (result.status !== 'success') {
                         return { success: false, message: result.message || "บันทึกข้อมูลไม่สำเร็จ" };
                     }
@@ -255,24 +508,29 @@
                 const newUsers = [...users, userToApprove];
                 setPendingUsers(newPending);
                 setUsers(newUsers);
-                if (GOOGLE_SCRIPT_URL) await syncToGoogle({ action: 'approveUser', userId });
+                if (sb) await syncToDb({ action: 'approveUser', userId });
             };
 
             const adminEditUser = async (userData) => {
-                const updatedUsers = users.map(u => u.id === userData.id ? { ...u, ...userData } : u);
+                // ไม่ทับ field ที่ส่งมาเป็นค่าว่าง (เช่น ไม่เปลี่ยนรหัสผ่าน) ในการอัปเดต state ชั่วคราว
+                const merge = { ...userData };
+                if (!merge.password) delete merge.password;
+
+                const updatedUsers = users.map(u => u.id === userData.id ? { ...u, ...merge } : u);
                 setUsers(updatedUsers);
                 
                 if (currentUser && currentUser.id === userData.id) {
-                    setCurrentUser({ ...currentUser, ...userData });
+                    setCurrentUser({ ...currentUser, ...merge });
                 }
 
-                const result = await syncToGoogle({ action: 'editUser', ...userData });
+                const result = await syncToDb({ action: 'editUser', ...userData });
+                if (result.status === 'success' && sb) fetchData(); // sync ค่าจริงจากฐานข้อมูล
                 return result.status === 'success';
             };
 
             const adminUpdateSettings = async (newSettings) => {
                 setSettings(newSettings);
-                const result = await syncToGoogle({ action: 'saveSettings', settings: newSettings });
+                const result = await syncToDb({ action: 'saveSettings', settings: newSettings });
                 return result.status === 'success';
             }
 
@@ -339,8 +597,8 @@
 
                 setBookings(newBookings);
                 
-                if (GOOGLE_SCRIPT_URL) {
-                    syncToGoogle({
+                if (sb) {
+                    syncToDb({
                         action: 'toggleBooking',
                         method,
                         dateKey,
@@ -365,7 +623,7 @@
 
                 setHolidays(newHolidays);
                 
-                if (GOOGLE_SCRIPT_URL) await syncToGoogle({ action: 'updateHoliday', dateKey, status: newHolidays[dateKey] });
+                if (sb) await syncToDb({ action: 'updateHoliday', dateKey, status: newHolidays[dateKey] });
                 
                 return { status: 'success' };
             };
@@ -376,18 +634,18 @@
                     const newPending = pendingUsers.filter(u => u.id !== userId);
                     setUsers(newUsers);
                     setPendingUsers(newPending);
-                    if(GOOGLE_SCRIPT_URL) await syncToGoogle({ action: 'deleteUser', userId });
+                    if (sb) await syncToDb({ action: 'deleteUser', userId });
                 });
             };
             
             const adminForceCancel = async (dateKey, userId) => { 
-                showModal('ยืนยันยกเลิก', 'คุณต้องการยกเลิกการจองนี้ใช่หรือไม่? ข้อมูลใน Sheet Plan จะถูกลบด้วย', 'confirm', async () => {
+                showModal('ยืนยันยกเลิก', 'คุณต้องการยกเลิกการจองนี้ใช่หรือไม่? ข้อมูลการจองนี้จะถูกลบออกจากฐานข้อมูลด้วย', 'confirm', async () => {
                     const uniqueKey = `${dateKey}_${userId}`;
                     const newBookings = { ...bookings };
                     delete newBookings[uniqueKey];
                     setBookings(newBookings);
                     
-                    if (GOOGLE_SCRIPT_URL) await syncToGoogle({ 
+                    if (sb) await syncToDb({ 
                         action: 'toggleBooking', 
                         method: 'remove', 
                         dateKey: dateKey,
@@ -404,7 +662,7 @@
                     modalConfig, showModal, closeModal,
                     setCurrentView, registerUser, approveUser, memberLogin, adminLogin, logout, 
                     toggleBooking, toggleHoliday, adminDeleteUser, adminEditUser, adminUpdateSettings, adminForceCancel,
-                    otAssignments, createOT, respondOT,masterQueueIds, updateMasterQueue,syncToGoogle,otHistory
+                    otAssignments, createOT, respondOT,masterQueueIds, updateMasterQueue,syncToDb,otHistory
                 }}>
                     {children}
                 </AppContext.Provider>
@@ -481,7 +739,7 @@
         };
 
         const OTUserCard = () => {
-            const { currentUser, otAssignments, respondOT, showModal, syncToGoogle } = useContext(AppContext);
+            const { currentUser, otAssignments, respondOT, showModal, syncToDb } = useContext(AppContext);
             
             const pendingOTs = otAssignments.filter(ot => {
                 const myQ = ot.queueData.find(q => String(q.userId) === String(currentUser.id));
@@ -495,7 +753,7 @@
 
             const handleCancel = (otId) => {
                 showModal("ยกเลิกด่วน", "คุณแน่ใจหรือไม่ที่จะยกเลิก OT นี้? ระบบจะแจ้งเตือน Admin ให้หาคนแทนทันที", "confirm", () => {
-                    syncToGoogle({ action: 'cancelOT', otId, userId: currentUser.id }).then(res => {
+                    syncToDb({ action: 'cancelOT', otId, userId: currentUser.id }).then(res => {
                         if(res.status==='success') window.location.reload();
                     });
                 });
@@ -2248,7 +2506,7 @@
                 setLocalSettings(prev => ({...prev, ...settings})); 
             }, [settings]);
 
-            const handleSaveSettings = () => {
+            const handleSaveSettings = async () => {
                  const updates = {
                      max_leaves_per_day: parseInt(localSettings.max_leaves_per_day),
                      default_quota: parseFloat(localSettings.default_quota),
@@ -2256,7 +2514,12 @@
                      min_advance_days: parseInt(localSettings.min_advance_days),     
                      max_advance_months: parseInt(localSettings.max_advance_months)  
                  };
-                 adminUpdateSettings(updates);
+                 const ok = await adminUpdateSettings(updates);
+                 showModal(
+                     ok ? "สำเร็จ" : "ผิดพลาด",
+                     ok ? "บันทึกการตั้งค่าเรียบร้อยแล้ว" : "บันทึกไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
+                     "alert"
+                 );
             };
 
             const handleAdminBookingSubmit = async (e) => {
@@ -2461,7 +2724,7 @@
         };
 
         const AdminCalendar = () => {
-            const { holidays, toggleHoliday, syncToGoogle } = useContext(AppContext);
+            const { holidays, toggleHoliday, syncToDb } = useContext(AppContext);
             const [currentDate, setCurrentDate] = useState(new Date());
             const [modalConfig, setModalConfig] = useState({ isOpen: false, dateKey: '', dateStr: '', currentStatus: null });
 
